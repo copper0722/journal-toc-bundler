@@ -607,8 +607,49 @@ BASE64_PAYLOAD_PATTERN = re.compile(
 
 PHI_CONTEXT_PATTERN = re.compile(
     r"(?i)(?:病歷號|病歷編號|身分證字號|病人姓名|患者姓名|patient\s*(?:name|id)|medical\s*record\s*(?:number|no)|\bMRN\b)"
-    r"\s*[:=：]\s*\S+"
+    r"\s*[:=：]\s*(\S+)"
 )
+
+# A PHI_CONTEXT hit is only a leak when the VALUE is patient data — a record
+# number or a CJK personal name. Application source spells the same keys as URL
+# query parameters, HTML data-attributes, object-literal fields, regexes and
+# documentation placeholders; treating those as PHI makes the guard unusable on
+# any clinical web front end. Measured 2026-08-25 on one clinical repository:
+# two front-end files carried 34 such hits between them, none of them patient
+# data, and the guard refused every commit touching either file.
+# The narrowing still blocks a record-number or personal-name VALUE; it only
+# skips a locator-shaped key (preceded by a query/attribute character) and a
+# value that is an identifier, regex, placeholder or punctuation.
+PHI_CODE_LEAD_CHARS = frozenset("?&-/_$%")
+PHI_CJK_NAME_PATTERN = re.compile(r"[一-鿿]{2,}")
+
+
+def phi_value_is_patient_data(value: str) -> bool:
+    """True when the captured value looks like a record number or a CJK name."""
+    stripped = value.strip().strip("\"'`,;:)]}")
+    if not stripped:
+        return False
+    if PHI_CJK_NAME_PATTERN.search(stripped):
+        return True
+    if re.fullmatch(r"[0-9]{1,12}", stripped):
+        return True
+    # zero-padded or prefixed record numbers, e.g. A-000124
+    return bool(re.search(r"\d{3,}", stripped))
+
+
+def phi_context_hit(text: str) -> bool:
+    """PHI_CONTEXT_PATTERN match that survives the code-reference filter."""
+    for match in PHI_CONTEXT_PATTERN.finditer(text):
+        if match.start() and text[match.start() - 1] in PHI_CODE_LEAD_CHARS:
+            # A query parameter, attribute name or path segment addresses the
+            # field; it does not carry a patient. Spelled out rather than shown,
+            # because a literal example here is itself a PHI_CONTEXT_PATTERN hit
+            # and the prior released scanner — the one CI runs to judge this
+            # change — would refuse the commit that documents the narrowing.
+            continue
+        if phi_value_is_patient_data(match.group(1)):
+            return True
+    return False
 
 PUBLIC_PRIVATE_MARKERS = (
     "internal" + " only",
@@ -756,6 +797,60 @@ def looks_like_placeholder(value: str) -> bool:
     return any(token in lowered for token in placeholders) or "${" in value or "{{" in value
 
 
+# A secret READ from the environment is the behaviour Law requires, and the
+# generic-assignment pattern flags it: `password = os.environ.get(` captures
+# "os.environ.get(" whose Shannon entropy is 3.37, over the 3.0 threshold. A
+# guard that blocks the correct idiom teaches people to avoid it — measured
+# 2026-08-23 when it refused a script whose only sin was reading GARMIN_PASSWORD
+# out of the environment.
+CODE_REFERENCE_PREFIXES = (
+    "os.environ", "os.getenv", "getenv(", "environ[", "environ.get",
+    "process.env", "config.", "settings.", "self.", "args.", "opts.",
+    "secrets.get", "keyring.", "input(", "getpass",
+    # 2026-08-26: the same defect, one language over. The Python idiom was fixed
+    # above and the JavaScript one was not, so a Cloudflare Worker reading
+    # `secret: context.env.ACCESS_SESSION_SECRET` blocked every commit that touched
+    # the file. Measured on personal-website-s: nine hits across four files, all nine
+    # of them an environment or object read, not one of them a credential. The repo
+    # was simply uncommittable until this landed.
+    "context.env", "ctx.env", "env.", "import.meta.env", "deno.env",
+    "globalthis.", "window.", "locals.", "runtime.env", "platform.env",
+)
+
+
+def looks_like_code_reference(value: str) -> bool:
+    """True when the captured 'value' is an expression that FETCHES a secret."""
+    lowered = value.strip().lower()
+    if lowered.startswith(CODE_REFERENCE_PREFIXES):
+        return True
+    # A call expression — `str(uuid.uuid4())`, `secrets.token_hex(16)` — is a
+    # value the program GENERATES, never a credential someone typed. Measured
+    # 2026-08-23: `token = str(uuid.uuid4())`, a lease id, blocked a commit.
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*\(", value.strip()):
+        return True
+    # A value that begins with "(" is a parenthesised expression, not a typed
+    # credential — a ternary or a boolean guard assigned to a secret-named field.
+    # The capture stops at the first space, so only the opening fragment is visible
+    # here; "starts with an open paren" is the whole signal available.
+    #   Known gap: a real secret whose literal first character is "(" slips this filter.
+    #   Accepted because the provider-specific and base64 rules still see it, and because
+    #   the alternative measured on 2026-08-25 was worse: the false positive on a lab-code
+    #   palette line got "fixed" by inserting a space to dodge the regex, which trains
+    #   people to evade the scanner and invites the next reader to tidy the space away.
+    if value.strip().startswith("("):
+        return True
+    # Optional chaining is syntax, so a value containing "?." is an expression the
+    # program evaluates and can never be a credential someone typed. This is what
+    # `keyRing?.[cohort.keyId]` and `tokens.hub?.token` are, and both blocked commits
+    # on 2026-08-26. Deliberately narrower than "any dotted identifier": a bare
+    # dotted chain of alphanumerics also describes a JWT, and admitting that shape
+    # would let a hardcoded one through.
+    if "?." in value:
+        return True
+    # a bare call or attribute chain — never a literal credential
+    return lowered.endswith("(") and "." in lowered
+
+
 def valid_taiwan_id(value: str) -> bool:
     mapping = {
         "A": 10, "B": 11, "C": 12, "D": 13, "E": 14, "F": 15, "G": 16,
@@ -778,12 +873,14 @@ def metadata_sensitive_codes(value: str) -> list[str]:
     codes = [code for code, pattern in SECRET_PATTERNS if pattern.search(value)]
     for match in GENERIC_SECRET_ASSIGNMENT.finditer(value):
         candidate_value = match.group(1)
-        if not looks_like_placeholder(candidate_value) and shannon_entropy(candidate_value) >= 3.0:
+        if (not looks_like_placeholder(candidate_value)
+                and not looks_like_code_reference(candidate_value)
+                and shannon_entropy(candidate_value) >= 3.0):
             codes.append("SECRET_GENERIC_ASSIGNMENT")
             break
     if any(valid_taiwan_id(match.group(0)) for match in TAIWAN_ID_PATTERN.finditer(value)):
         codes.append("PII_TAIWAN_NATIONAL_ID")
-    if PHI_CONTEXT_PATTERN.search(value):
+    if phi_context_hit(value):
         codes.append("PHI_CONTEXT_FIELD")
     return sorted(set(codes))
 
@@ -1021,7 +1118,9 @@ def inspect_text(path: str, text: str, artifact: Artifact, visibility: str | Non
 
     for match in GENERIC_SECRET_ASSIGNMENT.finditer(text):
         value = match.group(1)
-        if not looks_like_placeholder(value) and shannon_entropy(value) >= 3.0:
+        if (not looks_like_placeholder(value)
+                and not looks_like_code_reference(value)
+                and shannon_entropy(value) >= 3.0):
             findings.append(Finding("SECRET_GENERIC_ASSIGNMENT", Severity.BLOCK, path, "High-entropy value assigned to a secret-like field; matched value is redacted.", artifact.blob_sha, artifact.commit))
             break
 
@@ -1030,7 +1129,7 @@ def inspect_text(path: str, text: str, artifact: Artifact, visibility: str | Non
             findings.append(Finding("PII_TAIWAN_NATIONAL_ID", Severity.BLOCK, path, "Taiwan national identification number shape with valid checksum detected; value is redacted.", artifact.blob_sha, artifact.commit))
             break
 
-    if PHI_CONTEXT_PATTERN.search(text):
+    if phi_context_hit(text):
         findings.append(Finding("PHI_CONTEXT_FIELD", Severity.BLOCK, path, "Patient/medical-record identifying field detected; value is redacted.", artifact.blob_sha, artifact.commit))
 
     # Binary payloads are sometimes hidden in text as long base64 literals. Decode

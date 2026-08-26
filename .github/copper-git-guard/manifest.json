@@ -2,8 +2,8 @@
   "canonical_source": "copper0722/_admin-private:tools/copper-git-guard",
   "files": {
     ".copper-git-guard.toml": "c3ce68449858d819ddf79cc77c504f0ca9583c9916e1e8c8d49b99fe44309ee7",
-    ".github/copper-git-guard/copper_git_guard.py": "bf350eab5ef185faf8af6fede62dea6b7b7c4dd0a42734109529c93b9c28d358",
-    ".github/workflows/copper-git-guard.yml": "66d9b1b2e3faaa32a1310cd0c8eff5da44241ab72d5884609212a8f42d177032"
+    ".github/copper-git-guard/copper_git_guard.py": "e95dfc69c2214ffd74d37e0c9f30bac5fd87bf26ac84c647b7fd1f8c1e627e6b",
+    ".github/workflows/copper-git-guard.yml": "37082ec4d452698d81215b3eafa879ad89957a0c2c32c9d4badbe5e46d0b3fff"
   },
   "repository": "copper0722/journal-toc-bundler",
   "schema_version": 1,
