@@ -94,6 +94,17 @@ jobs:
           # parent/default-branch projection exists yet; that rollout is manual.
           if [[ -n "$TRUSTED_REF" ]] && git cat-file -e "$TRUSTED_REF:.github/copper-git-guard/copper_git_guard.py" 2>/dev/null; then
             git show "$TRUSTED_REF:.github/copper-git-guard/copper_git_guard.py" > "$SCANNER"
+            # Say so when the judging scanner is not the one in the tree. The rule above
+            # is right and stays, but it has a consequence that is invisible in the log:
+            # a commit that UPDATES the scanner is judged by the version it replaces, so
+            # an improvement can be blocked by exactly the defect it fixes. That happened
+            # on copper0722/proofread-agent run 32956054188 -- the vendored copy predated
+            # the 2026-08-23 environment-read exemption, so the commit teaching the guard
+            # about `context.env.*` was refused for containing the words `context.env.*`.
+            # Thirty minutes went into a BLOCK whose cause was one line of context.
+            if ! cmp -s "$SCANNER" .github/copper-git-guard/copper_git_guard.py; then
+              echo "::notice::judging scanner is $TRUSTED_REF ($(sha256sum "$SCANNER" | cut -c1-12)), tree has $(sha256sum .github/copper-git-guard/copper_git_guard.py | cut -c1-12). A finding here may be the OLD scanner's behaviour, not the new code's. Land a scanner update on its own commit, then the text that demonstrates it."
+            fi
           else
             cp .github/copper-git-guard/copper_git_guard.py "$SCANNER"
             echo "::warning::bootstrap scanner: no trusted prior projection exists"
