@@ -31,6 +31,32 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Only the canonical repository carries tools/copper-git-guard; everywhere
+      # else this step is a no-op. It exists because the vendored copy is what CI
+      # actually executes, and nothing else notices when it falls behind: on
+      # 2026-08-25 all 26 vendored copies were one scanner version stale, still
+      # enforcing a PHI rule that had already been narrowed at the source. Byte
+      # comparison only — under pull_request_target both paths are untrusted data.
+      - name: Verify the vendored scanner matches its canonical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANONICAL="tools/copper-git-guard/copper_git_guard.py"
+          VENDORED=".github/copper-git-guard/copper_git_guard.py"
+          if [[ ! -f "$CANONICAL" ]]; then
+            echo "not the canonical repository; nothing to compare"
+            exit 0
+          fi
+          if [[ ! -f "$VENDORED" ]]; then
+            echo "::error file=$VENDORED::vendored scanner is missing; run install.py ci"
+            exit 1
+          fi
+          if ! cmp -s "$CANONICAL" "$VENDORED"; then
+            echo "::error file=$VENDORED::vendored scanner is stale ($(sha256sum "$VENDORED" | cut -c1-12)) against $CANONICAL ($(sha256sum "$CANONICAL" | cut -c1-12)); redeploy it in this same commit with tools/copper-git-guard/install.py ci"
+            exit 1
+          fi
+          echo "vendored scanner matches canonical source"
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
