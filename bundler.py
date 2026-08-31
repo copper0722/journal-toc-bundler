@@ -38,6 +38,7 @@ import re
 import shlex
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -904,176 +905,78 @@ def fetch_binary_base64(jcfg: dict, url: str) -> dict:
     return json.loads(payload)
 
 
-def _osa_eval_in_tab(browser: str, tab_match: str, js: str) -> str:
-    """Run a JS expression in an existing Chrome tab via osascript `execute javascript`.
-    Returns the JS expression's value (raw stdout).
-
-    Helper for the NEJM video resolution chain (Task #9). Distinct from osa_run()
-    which dispatches into the bundled extractor.js — here we eval ad-hoc JS in
-    whatever tab matches `tab_match` (typically the article's /doi/full/<doi>).
-    """
-    js_esc = js.replace("\\", "\\\\").replace('"', '\\"')
-    applescript = (
-        f'tell application "{browser}"\n'
-        f'  set targetTab to missing value\n'
-        f'  repeat with w in windows\n'
-        f'    repeat with t in tabs of w\n'
-        f'      if (URL of t as string) contains "{tab_match}" then\n'
-        f'        set targetTab to t\n'
-        f'        exit repeat\n'
-        f'      end if\n'
-        f'    end repeat\n'
-        f'    if targetTab is not missing value then exit repeat\n'
-        f'  end repeat\n'
-        f'  if targetTab is missing value then return "NO_TAB"\n'
-        f'  return (execute targetTab javascript "{js_esc}")\n'
-        f'end tell'
-    )
-    r = subprocess.run(["osascript", "-e", applescript], capture_output=True, text=True, timeout=30)
-    return r.stdout.strip()
-
-
 def resolve_nejm_video_ref(jcfg: dict, article_url: str, nejmdo_ref: str, ajaxurl: str) -> dict:
-    """Resolve a single NEJM video reference to a downloaded 720w mp4.
+    """Resolve one NEJM video reference to a downloaded 720w mp4 — via the
+    canonical session resolver CLI (single authority, project_todo #1509).
 
-    Pipeline (doc: README §"NEJM video resolution"):
-      1. ensure article tab open in Chrome Beta (subscriber session cookies needed
-         so the /do/ ajax endpoint passes Cloudflare).
-      2. in-page `fetch(ajaxurl, credentials:'include', X-Requested-With:'XMLHttpRequest')`
-         (sync XHR hits Cloudflare 403; async fetch from page context passes).
-      3. parse JSON `{hasAccess:true, html:'<media-player-app mediaID="X" player="vrt|qt">'}`.
-         text-only Research Summary returns `{hasAccess:true}` without `html` → not video.
-      4. JW Platform API `https://content.jwplatform.com/v2/media/<mediaID>` (public,
-         stdlib OK, no Cloudflare).
-      5. pick 720w mp4 (label=="720w" or width==720), fallback first mp4.
-      6. download via stdlib urllib (JW CDN is content.jwplatform.com — public).
+    The former in-file implementation (osascript + Chrome Beta AppleScript,
+    Cloudflare-clearance polling, /do/ credentialed AJAX, JW Platform pick)
+    duplicated dev/download-nejm-video/cli/nejm-video-session-resolve.py and
+    the two copies drifted (the 2026-05-28 mediaID/media_id regex split). The
+    CLI now owns the whole chain and carries BOTH transports: osascript Chrome
+    Beta on macOS, resident-Chrome CDP on Linux (NEJM_VIDEO_TRANSPORT /
+    NEJM_VIDEO_CDP_ENDPOINT). Locate it with NEJM_VIDEO_RESOLVER_CLI, default
+    ~/dev/download-nejm-video/cli/nejm-video-session-resolve.py.
 
-    Returns dict with {media_id, mp4_url, duration, player_hint, title, _mp4_bytes}.
-    Returns empty dict on any failure (caller WARNs and moves on).
-
-    Caveat: figure-only animations (no narration) come back as silent <30s mp4 —
-    MacWhisper will FAIL "No audio track found" downstream; the bundle keeps the
-    mp4 as a figure asset. Examples: NEJMdo008410 (Zimmermann 12s), NEJMdo008475
-    (Silent Aspiration 17s).
+    Return shape is unchanged for existing callers:
+    {media_id, mp4_url, duration, player_hint, title, _mp4_bytes}; {} when the
+    ref is empty or the CLI is absent; {"error": ...} on a genuine failure.
+    Live parity proof 2026-08-31 (cu5, CDP transport): NEJMoa2604461 ->
+    NEJMdo008624 media_id=zB92lzKt 720w 4.2 MB; sibling NEJMdo008625
+    correctly classified not-video ({"hasAccess":true} without html).
     """
     if not nejmdo_ref or not ajaxurl:
         return {}
-    # Force-activate the SPECIFIC article tab. ensure_tab_open() only matches the
-    # DOMAIN, so with the TOC (or another nejm.org tab) open it no-ops and never
-    # brings THIS article forward — and a credentialed AJAX fetch fired from a
-    # backgrounded/discarded nejm tab returns the Cloudflare "Just a moment"
-    # challenge instead of the player JSON (confirmed 2026-06-04, the real cron
-    # failure mode). `open location` focuses+activates the exact article tab
-    # (Chrome dedups by URL), waking it so the fetch carries cf_clearance — this
-    # is what dev/download-nejm-video's session resolver does.
-    try:
-        subprocess.run(["osascript", "-e",
-            f'tell application "{jcfg["browser"]}"\n  activate\n  open location "{article_url}"\nend tell'],
-            capture_output=True, text=True, timeout=20)
-        time.sleep(2)
-    except Exception as e:
-        print(f"      WARN activate article tab failed: {e}")
-
-    tab_match = urldomain(article_url) + article_url.split(urldomain(article_url), 1)[1].split("?", 1)[0]
-    # Use article DOI fragment as tab matcher
-    doi_suffix = article_url.rsplit("/", 1)[-1]
-
-    # Wait for Cloudflare clearance before the credentialed AJAX fetch. A fetch
-    # fired before the article tab clears returns the "Just a moment..." challenge
-    # HTML instead of the player JSON (the 2026-06-04 timing failure — the regex
-    # fix alone was necessary but not sufficient). Poll readyState + title.
-    for _ in range(20):
-        chk = _osa_eval_in_tab(jcfg["browser"], doi_suffix,
-            "(function(){return (document.readyState||'')+'|'+(document.title||'');})()")
-        if chk and chk != "NO_TAB" and "Just a moment" not in chk and chk.split("|", 1)[0] == "complete":
-            break
-        time.sleep(1)
-
-    # 1+2. Kick async fetch (window.__nejm_vr=null first, then assigns on resolve).
-    # Robust extractor: no-throw JSON parse, media_id from html||raw with BOTH the
-    # lowercase iframe pattern (media_id=X) and legacy camelCase (mediaID="X"),
-    # plus a challenge flag so we re-kick after Cloudflare settles.
-    kick_js = (
-        "(function(){window.__nejm_vr=null;"
-        f"fetch('{ajaxurl}',{{credentials:'include',headers:{{'X-Requested-With':'XMLHttpRequest','Accept':'text/html,*/*'}}}})"
-        ".then(function(r){return r.text();})"
-        ".then(function(t){try{"
-        "var ch=t.indexOf('Just a moment')>-1||t.indexOf('cf-browser-verification')>-1||t.indexOf('challenge-platform')>-1;"
-        "var j=null;try{j=JSON.parse(t);}catch(e){}"
-        "var html=(j&&j.html)||'';var s=html||t;"
-        "var m=s.match(/media_id=([A-Za-z0-9]+)/)||s.match(/mediaID=\"([A-Za-z0-9]+)\"/);"
-        "var pm=s.match(/player=\"?([a-z]+)\"?/);"
-        "window.__nejm_vr={ok:true,challenge:ch,media_id:m?m[1]:null,player:pm?pm[1]:null,bytes:t.length,has_html:html.length>0};}"
-        "catch(e){window.__nejm_vr={ok:false,error:String(e)};}})"
-        ".catch(function(e){window.__nejm_vr={ok:false,error:String(e)};});"
-        "return 'KICKED';})()"
-    )
-
-    # 3. Kick + poll, retrying if a Cloudflare challenge slips through.
-    media_id = None
-    player_hint = None
-    for _attempt in range(4):
-        _osa_eval_in_tab(jcfg["browser"], doi_suffix, kick_js)
-        d = None
-        for _ in range(12):  # up to ~12s
-            time.sleep(1)
-            out = _osa_eval_in_tab(jcfg["browser"], doi_suffix, "(function(){return window.__nejm_vr?JSON.stringify(window.__nejm_vr):'PENDING';})()")
-            if out and out != "PENDING" and out != "NO_TAB":
-                try:
-                    d = json.loads(out)
-                except Exception:
-                    d = None
-                break
-        if d and d.get("ok") and d.get("media_id"):
-            media_id = d["media_id"]
-            player_hint = d.get("player")
-            break
-        if d and d.get("challenge"):
-            time.sleep(4)  # let Cloudflare finish its JS challenge, then re-kick
-            continue
-        break  # real non-video response (e.g. text Research Summary {hasAccess:true})
-    if not media_id:
-        return {"error": "no media_id", "nejmdo": nejmdo_ref, "player_hint": player_hint}
-
-    # 4-5. Query JW Platform
-    try:
-        import urllib.request as _ur
-        with _ur.urlopen(f"https://content.jwplatform.com/v2/media/{media_id}", timeout=20) as resp:
-            data = json.load(resp)
-    except Exception as e:
-        return {"error": f"jw lookup failed: {e}", "media_id": media_id}
-
-    pl = (data.get("playlist") or [{}])[0]
-    mp4_url = None
-    for s in pl.get("sources", []):
-        if s.get("type") == "video/mp4" and (s.get("label") == "720w" or s.get("width") == 720):
-            mp4_url = s.get("file")
-            break
-    if not mp4_url:
-        for s in pl.get("sources", []):
-            if s.get("type") == "video/mp4":
-                mp4_url = s.get("file")
-                break
-    if not mp4_url:
-        return {"error": "no mp4 source", "media_id": media_id}
-
-    # 6. Download
-    try:
-        import urllib.request as _ur
-        req = _ur.Request(mp4_url, headers={"User-Agent": "Mozilla/5.0 nejm-bundler"})
-        with _ur.urlopen(req, timeout=120) as resp:
-            mp4_bytes = resp.read()
-    except Exception as e:
-        return {"error": f"mp4 download failed: {e}", "media_id": media_id, "mp4_url": mp4_url}
-
-    return {
-        "media_id": media_id,
-        "mp4_url": mp4_url,
-        "title": pl.get("title"),
-        "duration": pl.get("duration"),
-        "player_hint": player_hint or "vrt",
-        "_mp4_bytes": mp4_bytes,
-    }
+    cli = os.environ.get(
+        "NEJM_VIDEO_RESOLVER_CLI",
+        os.path.expanduser("~/dev/download-nejm-video/cli/nejm-video-session-resolve.py"))
+    if not os.path.exists(cli):
+        print(f"      WARN video resolver CLI missing: {cli}")
+        return {}
+    m = re.search(r"(10\.\d{4,9}/[^/?#]+)", article_url)
+    if not m:
+        return {"error": f"cannot derive DOI from {article_url}"}
+    doi = m.group(1)
+    with tempfile.TemporaryDirectory(prefix="nejm-video-") as tmp:
+        try:
+            r = subprocess.run(
+                [sys.executable, cli, "fetch", doi, "--out", tmp, "-q", "720", "--json"],
+                capture_output=True, text=True, timeout=420)
+        except subprocess.TimeoutExpired:
+            return {"error": "resolver CLI timeout"}
+        if r.returncode != 0:
+            return {"error": f"resolver CLI rc={r.returncode}: {(r.stderr or '')[-200:]}"}
+        try:
+            payload = json.loads((r.stdout or "").strip() or "[]")
+        except ValueError:
+            return {"error": f"resolver CLI emitted no JSON: {(r.stdout or '')[:160]}"}
+        entry = next((e for e in payload if e.get("doi") == doi), None)
+        if not entry:
+            return {"error": "resolver CLI returned no entry for the DOI"}
+        want = nejmdo_ref if nejmdo_ref.startswith("10.1056/") else f"10.1056/{nejmdo_ref}"
+        result = next((x for x in entry.get("results", [])
+                       if (x.get("nejmdo") or "").lower() == want.lower()), None)
+        download = next((d for d in entry.get("downloads", [])
+                         if (d.get("nejmdo") or "").lower() == want.lower()), None)
+        if result and not result.get("is_video"):
+            # text-only Research Summary etc. — caller treats {} sans media_id as skip
+            return {"player_hint": result.get("player")}
+        if not download:
+            if result and result.get("media_id"):
+                return {"error": "no mp4 downloaded", "media_id": result.get("media_id")}
+            return {"error": "ref not found in resolver output", "nejmdo": nejmdo_ref}
+        try:
+            mp4_bytes = Path(download["path"]).read_bytes()
+        except OSError as e:
+            return {"error": f"mp4 read failed: {e}", "media_id": download.get("media_id")}
+        return {
+            "media_id": download.get("media_id"),
+            "mp4_url": download.get("mp4_url"),
+            "title": download.get("title"),
+            "duration": download.get("duration"),
+            "player_hint": (result or {}).get("player") or "vrt",
+            "_mp4_bytes": mp4_bytes,
+        }
 
 
 def discover_issue_audio(jcfg: dict, yymmdd: str) -> dict:
